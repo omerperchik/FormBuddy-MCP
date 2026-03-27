@@ -1,0 +1,27 @@
+{
+  "name": "formbuddy-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for FormBuddy — AI-powered form filling via any MCP client",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": ["mcp", "formbuddy", "forms", "pdf", "ocr"],
+  "author": "Omer Perchik",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "firebase-admin": "^13.0.0",
+    "pdf-lib": "^1.17.1",
+    "sharp": "^0.33.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
