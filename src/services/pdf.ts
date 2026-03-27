@@ -1,10 +1,16 @@
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { PDFDocument, StandardFonts, rgb, PDFFont, PDFPage } from "pdf-lib";
 import type { DetectedField } from "./ocr.js";
+import { matchAllFields, type FieldMatch } from "./matching.js";
 
 export interface FillResult {
   pdfBytes: Uint8Array;
   filledFields: string[];
   skippedFields: string[];
+}
+
+export interface AutoFillResult extends FillResult {
+  matches: FieldMatch[];
+  unmatchedFields: string[];
 }
 
 /**
@@ -13,7 +19,8 @@ export interface FillResult {
  */
 export async function fillPdfForm(
   pdfBytes: Uint8Array,
-  fieldValues: Record<string, string>
+  fieldValues: Record<string, string>,
+  options?: { flatten?: boolean }
 ): Promise<FillResult> {
   const pdf = await PDFDocument.load(pdfBytes);
   const form = pdf.getForm();
@@ -21,39 +28,18 @@ export async function fillPdfForm(
 
   const filledFields: string[] = [];
   const skippedFields: string[] = [];
+  const shouldFlatten = options?.flatten ?? true;
 
   if (formFields.length > 0) {
-    // PDF has AcroForm fields — fill them directly
     for (const [key, value] of Object.entries(fieldValues)) {
-      try {
-        const field = form.getTextField(key);
-        field.setText(value);
+      if (tryFillField(form, key, value)) {
         filledFields.push(key);
-      } catch {
-        // Field not found or not a text field — try other types
-        try {
-          const checkbox = form.getCheckBox(key);
-          if (value === "true" || value === "yes" || value === "1") {
-            checkbox.check();
-          } else {
-            checkbox.uncheck();
-          }
-          filledFields.push(key);
-        } catch {
-          try {
-            const dropdown = form.getDropdown(key);
-            dropdown.select(value);
-            filledFields.push(key);
-          } catch {
-            skippedFields.push(key);
-          }
-        }
+      } else {
+        skippedFields.push(key);
       }
     }
-
-    form.flatten();
+    if (shouldFlatten) form.flatten();
   } else {
-    // No AcroForm fields — use text overlay at detected positions
     const result = await overlayTextOnPdf(pdf, fieldValues);
     filledFields.push(...result.filled);
     skippedFields.push(...result.skipped);
@@ -63,140 +49,120 @@ export async function fillPdfForm(
   return { pdfBytes: resultBytes, filledFields, skippedFields };
 }
 
+function tryFillField(form: ReturnType<PDFDocument["getForm"]>, key: string, value: string): boolean {
+  // Try text field
+  try {
+    const field = form.getTextField(key);
+    field.setText(value);
+    return true;
+  } catch { /* not a text field or doesn't exist */ }
+
+  // Try checkbox
+  try {
+    const checkbox = form.getCheckBox(key);
+    const truthy = ["true", "yes", "1", "x", "on"].includes(value.toLowerCase());
+    truthy ? checkbox.check() : checkbox.uncheck();
+    return true;
+  } catch { /* not a checkbox */ }
+
+  // Try dropdown
+  try {
+    const dropdown = form.getDropdown(key);
+    dropdown.select(value);
+    return true;
+  } catch { /* not a dropdown */ }
+
+  // Try radio group
+  try {
+    const radio = form.getRadioGroup(key);
+    radio.select(value);
+    return true;
+  } catch { /* not a radio group */ }
+
+  return false;
+}
+
 /**
- * Overlay text onto a PDF at approximate positions based on field labels.
- * Used when the PDF doesn't have AcroForm fields.
+ * Overlay text onto a PDF, paginating as needed.
  */
 async function overlayTextOnPdf(
   pdf: PDFDocument,
   fieldValues: Record<string, string>
 ): Promise<{ filled: string[]; skipped: string[] }> {
   const font = await pdf.embedFont(StandardFonts.Helvetica);
-  const pages = pdf.getPages();
+  const boldFont = await pdf.embedFont(StandardFonts.HelveticaBold);
   const filled: string[] = [];
   const skipped: string[] = [];
 
-  // Simple layout: place fields sequentially on the first page
-  const page = pages[0];
-  const { height } = page.getSize();
+  let page = pdf.getPages()[0] || pdf.addPage();
+  let { height } = page.getSize();
   let yOffset = height - 50;
 
   for (const [label, value] of Object.entries(fieldValues)) {
-    if (yOffset < 50) {
-      skipped.push(label);
-      continue;
+    if (yOffset < 60) {
+      page = pdf.addPage();
+      height = page.getSize().height;
+      yOffset = height - 50;
     }
 
-    page.drawText(`${label}: ${value}`, {
-      x: 50,
-      y: yOffset,
-      size: 11,
-      font,
-      color: rgb(0, 0, 0),
-    });
-
-    yOffset -= 20;
+    drawField(page, label, value, 50, yOffset, font, boldFont);
+    yOffset -= 24;
     filled.push(label);
   }
 
   return { filled, skipped };
 }
 
+function drawField(
+  page: PDFPage,
+  label: string,
+  value: string,
+  x: number,
+  y: number,
+  font: PDFFont,
+  boldFont: PDFFont
+): void {
+  page.drawText(`${label}:`, { x, y, size: 10, font: boldFont, color: rgb(0.2, 0.2, 0.2) });
+  const labelWidth = boldFont.widthOfTextAtSize(`${label}: `, 10);
+  page.drawText(value, { x: x + labelWidth, y, size: 10, font, color: rgb(0, 0, 0) });
+}
+
 /**
- * Fill PDF using detected fields and profile data.
- * Matches detected field labels to profile field keys.
+ * Auto-fill PDF by matching detected fields to profile data using the matching engine.
  */
 export async function autoFillPdf(
   pdfBytes: Uint8Array,
   detectedFields: DetectedField[],
-  profileFields: Record<string, string>
-): Promise<FillResult & { matchedFields: Array<{ detected: string; profile: string }> }> {
+  profileFields: Record<string, string>,
+  options?: { minScore?: number; flatten?: boolean }
+): Promise<AutoFillResult> {
+  const labels = detectedFields.map((f) => f.label);
+  const profileKeys = Object.keys(profileFields);
+  const { matched, unmatched } = matchAllFields(labels, profileKeys, options?.minScore ?? 0.6);
+
   const fieldValues: Record<string, string> = {};
-  const matchedFields: Array<{ detected: string; profile: string }> = [];
-
-  for (const detected of detectedFields) {
-    const profileKey = findBestMatch(detected.label, Object.keys(profileFields));
-    if (profileKey) {
-      fieldValues[detected.label] = profileFields[profileKey];
-      matchedFields.push({ detected: detected.label, profile: profileKey });
-    }
+  for (const m of matched) {
+    fieldValues[m.detectedLabel] = profileFields[m.profileKey];
   }
 
-  const result = await fillPdfForm(pdfBytes, fieldValues);
-  return { ...result, matchedFields };
-}
-
-/**
- * Simple fuzzy matching: find the best profile key for a detected field label.
- */
-function findBestMatch(label: string, profileKeys: string[]): string | null {
-  const normalized = label.toLowerCase().replace(/[^a-z0-9]/g, "");
-
-  // Exact match
-  for (const key of profileKeys) {
-    if (key.toLowerCase().replace(/[^a-z0-9]/g, "") === normalized) {
-      return key;
-    }
-  }
-
-  // Common field aliases
-  const aliases: Record<string, string[]> = {
-    name: ["fullname", "full_name", "legal_name", "legalname"],
-    firstname: ["first_name", "fname", "givenname", "given_name"],
-    lastname: ["last_name", "lname", "surname", "familyname", "family_name"],
-    email: ["emailaddress", "email_address", "e_mail"],
-    phone: ["phonenumber", "phone_number", "telephone", "tel", "mobile"],
-    address: ["streetaddress", "street_address", "address1", "address_line_1"],
-    city: ["town"],
-    state: ["province", "region"],
-    zip: ["zipcode", "zip_code", "postalcode", "postal_code"],
-    ssn: ["socialsecurity", "social_security", "socialsecuritynumber"],
-    dob: ["dateofbirth", "date_of_birth", "birthday", "birthdate"],
-    company: ["companyname", "company_name", "organization", "employer"],
+  const result = await fillPdfForm(pdfBytes, fieldValues, { flatten: options?.flatten });
+  return {
+    ...result,
+    matches: matched,
+    unmatchedFields: unmatched,
   };
-
-  for (const key of profileKeys) {
-    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-
-    // Check if label matches any alias of this key
-    for (const [canonical, aliasList] of Object.entries(aliases)) {
-      const allVariants = [canonical, ...aliasList];
-      if (allVariants.includes(normalized) && allVariants.includes(normalizedKey)) {
-        return key;
-      }
-    }
-
-    // Substring match
-    if (normalized.includes(normalizedKey) || normalizedKey.includes(normalized)) {
-      return key;
-    }
-  }
-
-  return null;
-}
-
-/**
- * Extract text content from a PDF for field detection.
- */
-export async function extractPdfText(pdfBytes: Uint8Array): Promise<string> {
-  const pdf = await PDFDocument.load(pdfBytes);
-  // pdf-lib doesn't support text extraction natively.
-  // Return page count info; actual text extraction requires OCR on rendered pages.
-  const pageCount = pdf.getPageCount();
-  return `[PDF with ${pageCount} page(s) — use OCR for text extraction]`;
 }
 
 /**
  * Get metadata about a PDF (page count, form fields, etc.)
  */
-export async function getPdfInfo(
-  pdfBytes: Uint8Array
-): Promise<{
+export async function getPdfInfo(pdfBytes: Uint8Array): Promise<{
   pageCount: number;
   hasForm: boolean;
-  formFieldNames: string[];
+  formFields: Array<{ name: string; type: string }>;
   title: string | undefined;
   author: string | undefined;
+  creationDate: Date | undefined;
 }> {
   const pdf = await PDFDocument.load(pdfBytes);
   const form = pdf.getForm();
@@ -205,42 +171,49 @@ export async function getPdfInfo(
   return {
     pageCount: pdf.getPageCount(),
     hasForm: fields.length > 0,
-    formFieldNames: fields.map((f) => f.getName()),
+    formFields: fields.map((f) => ({
+      name: f.getName(),
+      type: f.constructor.name.replace("PDF", "").replace("Field", "").toLowerCase(),
+    })),
     title: pdf.getTitle(),
     author: pdf.getAuthor(),
+    creationDate: pdf.getCreationDate(),
   };
 }
 
 /**
- * Create a new blank PDF with form fields based on detected fields.
+ * Create a new PDF with interactive form fields.
+ * Handles pagination automatically.
  */
 export async function createFormPdf(
-  fields: Array<{ label: string; type: string }>
+  fields: Array<{ label: string; type: string }>,
+  title?: string
 ): Promise<Uint8Array> {
   const pdf = await PDFDocument.create();
+  if (title) pdf.setTitle(title);
   const font = await pdf.embedFont(StandardFonts.Helvetica);
-  const page = pdf.addPage();
-  const { width, height } = page.getSize();
+  const boldFont = await pdf.embedFont(StandardFonts.HelveticaBold);
   const form = pdf.getForm();
 
+  let page = pdf.addPage();
+  let { width, height } = page.getSize();
   let yOffset = height - 50;
 
+  // Title
+  if (title) {
+    page.drawText(title, { x: 50, y: yOffset, size: 18, font: boldFont, color: rgb(0, 0, 0) });
+    yOffset -= 40;
+  }
+
   for (const field of fields) {
-    if (yOffset < 50) {
-      const newPage = pdf.addPage();
-      yOffset = newPage.getSize().height - 50;
+    if (yOffset < 60) {
+      page = pdf.addPage();
+      ({ width, height } = page.getSize());
+      yOffset = height - 50;
     }
 
-    // Draw label
-    page.drawText(field.label, {
-      x: 50,
-      y: yOffset,
-      size: 11,
-      font,
-      color: rgb(0, 0, 0),
-    });
+    page.drawText(field.label, { x: 50, y: yOffset, size: 10, font, color: rgb(0.2, 0.2, 0.2) });
 
-    // Create form field
     const textField = form.createTextField(field.label);
     textField.addToPage(page, {
       x: 200,
@@ -253,4 +226,40 @@ export async function createFormPdf(
   }
 
   return pdf.save();
+}
+
+/**
+ * Merge multiple PDFs into one document.
+ */
+export async function mergePdfs(pdfBuffers: Uint8Array[]): Promise<Uint8Array> {
+  const merged = await PDFDocument.create();
+
+  for (const buf of pdfBuffers) {
+    const donor = await PDFDocument.load(buf);
+    const pages = await merged.copyPages(donor, donor.getPageIndices());
+    for (const page of pages) {
+      merged.addPage(page);
+    }
+  }
+
+  return merged.save();
+}
+
+/**
+ * Extract specific pages from a PDF.
+ */
+export async function extractPages(
+  pdfBytes: Uint8Array,
+  pageNumbers: number[]
+): Promise<Uint8Array> {
+  const source = await PDFDocument.load(pdfBytes);
+  const output = await PDFDocument.create();
+
+  const indices = pageNumbers.map((n) => n - 1).filter((i) => i >= 0 && i < source.getPageCount());
+  const pages = await output.copyPages(source, indices);
+  for (const page of pages) {
+    output.addPage(page);
+  }
+
+  return output.save();
 }

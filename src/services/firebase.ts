@@ -1,38 +1,32 @@
 import admin from "firebase-admin";
+import type { Config } from "../config.js";
 
 let initialized = false;
 
-export function initFirebase(): void {
-  if (initialized) return;
+export function initFirebase(config: Config): void {
+  if (initialized || !config.firebase.enabled) return;
 
-  const serviceAccountPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const opts: admin.AppOptions = {
+    storageBucket: config.firebase.storageBucket ?? undefined,
+  };
 
-  if (serviceAccountPath) {
-    admin.initializeApp({
-      credential: admin.credential.applicationDefault(),
-      storageBucket: `${projectId}.firebasestorage.app`,
-    });
-  } else {
-    admin.initializeApp({
-      projectId: projectId || "formbuddy",
-      storageBucket: `${projectId || "formbuddy"}.firebasestorage.app`,
-    });
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    opts.credential = admin.credential.applicationDefault();
+  }
+  if (config.firebase.projectId) {
+    opts.projectId = config.firebase.projectId;
   }
 
+  admin.initializeApp(opts);
   initialized = true;
 }
 
-export function getFirestore(): admin.firestore.Firestore {
+function db(): admin.firestore.Firestore {
   return admin.firestore();
 }
 
-export function getStorage(): admin.storage.Storage {
-  return admin.storage();
-}
-
-export function getAuth(): admin.auth.Auth {
-  return admin.auth();
+function bucket(): ReturnType<admin.storage.Storage["bucket"]> {
+  return admin.storage().bucket();
 }
 
 // ── Profile operations ──
@@ -47,51 +41,45 @@ export interface Profile {
   updatedAt: string;
 }
 
-export async function listProfiles(userId: string): Promise<Profile[]> {
-  const db = getFirestore();
-  const snapshot = await db
-    .collection("profiles")
-    .where("userId", "==", userId)
-    .get();
-
-  return snapshot.docs.map((doc) => {
-    const { id: _, ...data } = doc.data() as Profile;
-    return { ...data, id: doc.id } as Profile;
-  });
+function docToProfile(doc: admin.firestore.DocumentSnapshot): Profile {
+  const data = doc.data()!;
+  return {
+    id: doc.id,
+    userId: data.userId,
+    name: data.name,
+    type: data.type,
+    fields: data.fields ?? {},
+    createdAt: data.createdAt,
+    updatedAt: data.updatedAt,
+  };
 }
 
-export async function getProfile(
-  userId: string,
-  profileId: string
-): Promise<Profile | null> {
-  const db = getFirestore();
-  const doc = await db.collection("profiles").doc(profileId).get();
+export async function listProfiles(userId: string): Promise<Profile[]> {
+  const snapshot = await db()
+    .collection("profiles")
+    .where("userId", "==", userId)
+    .orderBy("updatedAt", "desc")
+    .get();
 
+  return snapshot.docs.map(docToProfile);
+}
+
+export async function getProfile(userId: string, profileId: string): Promise<Profile | null> {
+  const doc = await db().collection("profiles").doc(profileId).get();
   if (!doc.exists) return null;
-  const { id: _, ...data } = doc.data() as Profile;
-  if (data.userId !== userId) return null;
-
-  return { ...data, id: doc.id } as Profile;
+  const profile = docToProfile(doc);
+  if (profile.userId !== userId) return null;
+  return profile;
 }
 
 export async function createProfile(
   userId: string,
   data: { name: string; type: Profile["type"]; fields: Record<string, string> }
 ): Promise<Profile> {
-  const db = getFirestore();
   const now = new Date().toISOString();
-
-  const profile = {
-    userId,
-    name: data.name,
-    type: data.type,
-    fields: data.fields,
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  const ref = await db.collection("profiles").add(profile);
-  return { id: ref.id, ...profile };
+  const payload = { userId, name: data.name, type: data.type, fields: data.fields, createdAt: now, updatedAt: now };
+  const ref = await db().collection("profiles").add(payload);
+  return { id: ref.id, ...payload };
 }
 
 export async function updateProfile(
@@ -99,84 +87,115 @@ export async function updateProfile(
   profileId: string,
   updates: { name?: string; type?: Profile["type"]; fields?: Record<string, string> }
 ): Promise<Profile | null> {
-  const db = getFirestore();
-  const doc = await db.collection("profiles").doc(profileId).get();
-
+  const ref = db().collection("profiles").doc(profileId);
+  const doc = await ref.get();
   if (!doc.exists) return null;
-  const existing = doc.data() as Profile;
+
+  const existing = docToProfile(doc);
   if (existing.userId !== userId) return null;
 
+  // Merge fields rather than replace
+  const mergedFields = updates.fields
+    ? { ...existing.fields, ...updates.fields }
+    : existing.fields;
+
   const patch = {
-    ...updates,
+    ...(updates.name !== undefined && { name: updates.name }),
+    ...(updates.type !== undefined && { type: updates.type }),
+    fields: mergedFields,
     updatedAt: new Date().toISOString(),
   };
 
-  await db.collection("profiles").doc(profileId).update(patch);
-
-  const { id: _, ...existingData } = existing;
-  return { ...existingData, ...patch, id: profileId } as Profile;
+  await ref.update(patch);
+  return { ...existing, ...patch };
 }
 
-// ── Document storage operations ──
+export async function deleteProfile(userId: string, profileId: string): Promise<boolean> {
+  const ref = db().collection("profiles").doc(profileId);
+  const doc = await ref.get();
+  if (!doc.exists) return false;
+  const profile = docToProfile(doc);
+  if (profile.userId !== userId) return false;
+  await ref.delete();
+  return true;
+}
+
+// ── Document storage ──
 
 export async function uploadDocument(
   userId: string,
   fileName: string,
   buffer: Buffer,
   contentType: string
-): Promise<string> {
-  const bucket = getStorage().bucket();
-  const path = `documents/${userId}/${Date.now()}_${fileName}`;
-  const file = bucket.file(path);
+): Promise<{ url: string; path: string }> {
+  const storagePath = `documents/${userId}/${Date.now()}_${fileName}`;
+  const file = bucket().file(storagePath);
 
   await file.save(buffer, { contentType, resumable: false });
   const [url] = await file.getSignedUrl({
     action: "read",
-    expires: Date.now() + 3600 * 1000, // 1 hour
+    expires: Date.now() + 3600 * 1000,
   });
 
-  return url;
+  return { url, path: storagePath };
 }
 
 export async function getDocumentBuffer(storagePath: string): Promise<Buffer> {
-  const bucket = getStorage().bucket();
-  const [buffer] = await bucket.file(storagePath).download();
+  const [buffer] = await bucket().file(storagePath).download();
   return buffer;
 }
 
-// ── Form template operations ──
+// ── Template operations ──
 
 export interface FormTemplate {
   id: string;
   name: string;
   description: string;
   category: string;
+  tags: string[];
   storagePath: string;
+  fieldCount: number;
 }
 
-export async function listTemplates(
-  category?: string
-): Promise<FormTemplate[]> {
-  const db = getFirestore();
-  let query: admin.firestore.Query = db.collection("templates");
+function docToTemplate(doc: admin.firestore.DocumentSnapshot): FormTemplate {
+  const data = doc.data()!;
+  return {
+    id: doc.id,
+    name: data.name,
+    description: data.description ?? "",
+    category: data.category ?? "general",
+    tags: data.tags ?? [],
+    storagePath: data.storagePath,
+    fieldCount: data.fieldCount ?? 0,
+  };
+}
+
+export async function listTemplates(category?: string, search?: string): Promise<FormTemplate[]> {
+  let query: admin.firestore.Query = db().collection("templates");
 
   if (category) {
     query = query.where("category", "==", category);
   }
 
   const snapshot = await query.get();
-  return snapshot.docs.map((doc) => {
-    const { id: _, ...data } = doc.data() as FormTemplate;
-    return { ...data, id: doc.id } as FormTemplate;
-  });
+  let templates = snapshot.docs.map(docToTemplate);
+
+  // Client-side search filter (Firestore doesn't support full-text search)
+  if (search) {
+    const term = search.toLowerCase();
+    templates = templates.filter(
+      (t) =>
+        t.name.toLowerCase().includes(term) ||
+        t.description.toLowerCase().includes(term) ||
+        t.tags.some((tag) => tag.toLowerCase().includes(term))
+    );
+  }
+
+  return templates;
 }
 
-export async function getTemplate(
-  templateId: string
-): Promise<FormTemplate | null> {
-  const db = getFirestore();
-  const doc = await db.collection("templates").doc(templateId).get();
+export async function getTemplate(templateId: string): Promise<FormTemplate | null> {
+  const doc = await db().collection("templates").doc(templateId).get();
   if (!doc.exists) return null;
-  const { id: _, ...data } = doc.data() as FormTemplate;
-  return { ...data, id: doc.id } as FormTemplate;
+  return docToTemplate(doc);
 }
